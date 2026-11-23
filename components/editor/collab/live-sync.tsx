@@ -1,0 +1,309 @@
+"use client";
+
+// The binding's build has no "use client" directive: import it only from
+// client modules like this one
+import { RealtimeProvider, useLiveQuery } from "@neon/realtime-react";
+import { createRealtimeClient } from "@neon/realtime/client";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import {
+  useEditor,
+  useEditorStoreApi,
+} from "@/components/editor/editor-store-context";
+import type { AwaitSync } from "@/lib/collab/outbox";
+import type { LivePresenceRow } from "@/lib/collab/presence";
+import { createRenewalBatcher } from "@/lib/collab/renewals";
+import type { LiveCommentRow } from "@/lib/comments/live-rows";
+import type { LiveStatus } from "@/lib/editor/store";
+import { LIVE_QUERY_NAMES, LIVE_QUERY_SHAPE } from "@/lib/realtime/rows";
+import type {
+  LiveConfig,
+  LiveElementRow,
+  LivePageRow,
+  LivePagesRow,
+  LiveQueries as SealedQueries,
+  LiveQueryName,
+} from "@/lib/realtime/rows";
+
+// How long a write may take to come back on the live query before we stop
+// waiting and keep the local copy on screen
+const AWAIT_SYNC_TIMEOUT_MS = 10_000;
+
+type QueryStatus = "connecting" | "live" | "stale" | "error" | "closed";
+
+const NOT_FOUND = 404;
+
+class RenewError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`Couldn't renew the live query (${status})`);
+    this.name = "RenewError";
+    this.status = status;
+  }
+}
+
+// Freshly sealed queries, in one request however many. `v` asks for the
+// queries in the shape this editor reads (every page's elements).
+const fetchSealed = async (
+  designId: string,
+  queries: readonly LiveQueryName[]
+): Promise<Partial<SealedQueries>> => {
+  const response = await fetch(`/api/designs/${designId}/live`, {
+    body: JSON.stringify({ queries, v: LIVE_QUERY_SHAPE }),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new RenewError(response.status);
+  }
+  const { sealed }: { sealed: Partial<SealedQueries> } = await response.json();
+  return sealed;
+};
+
+// The design was made private or deleted: no point reconnecting
+const isAccessLost = (error: unknown) =>
+  error instanceof RenewError && error.status === NOT_FOUND;
+
+const combineStatus = (statuses: QueryStatus[]): LiveStatus => {
+  if (statuses.includes("error")) {
+    return "error";
+  }
+  if (statuses.includes("connecting") || statuses.includes("closed")) {
+    return "connecting";
+  }
+  return statuses.includes("stale") ? "stale" : "live";
+};
+
+interface LiveQueriesProps {
+  live: LiveConfig;
+  setAwaitSync: (awaitSync: AwaitSync | null) => void;
+}
+
+// Subscribes to the design's row, its pages, element rows, presence rows
+// and comments, and feeds every result into the store, where pages and
+// elements are rebased under this window's own unconfirmed edits.
+const LiveQueries = ({ live, setAwaitSync }: LiveQueriesProps) => {
+  const store = useEditorStoreApi();
+  // One request a minute renews every query: they ask within moments of
+  // each other, and the batcher sends them together (lib/collab/renewals)
+  // Created once per session and never replaced
+  // oxlint-disable-next-line react/hook-use-state
+  const [renewals] = useState(() =>
+    createRenewalBatcher<SealedQueries>({
+      fetchBatch: (names) => fetchSealed(store.getState().designId, names),
+      names: LIVE_QUERY_NAMES,
+    })
+  );
+  // Renewals that find the design gone stop the editor instead of retrying
+  const renew = useCallback(
+    async <Name extends LiveQueryName>(
+      query: Name
+    ): Promise<SealedQueries[Name]> => {
+      try {
+        return await renewals.renew(query);
+      } catch (error) {
+        if (isAccessLost(error)) {
+          store.getState().loseAccess();
+        }
+        throw error;
+      }
+    },
+    [renewals, store]
+  );
+  const refreshPage = useCallback(() => renew("page"), [renew]);
+  const refreshElements = useCallback(() => renew("elements"), [renew]);
+  const page = useLiveQuery(live.page, { refreshQuery: refreshPage });
+  const refreshPages = useCallback(() => renew("pages"), [renew]);
+  const pages = useLiveQuery(live.pages, { refreshQuery: refreshPages });
+  const elements = useLiveQuery(live.elements, {
+    refreshQuery: refreshElements,
+  });
+  const refreshPresence = useCallback(() => renew("presence"), [renew]);
+  const presence = useLiveQuery(live.presence, {
+    refreshQuery: refreshPresence,
+  });
+  const refreshComments = useCallback(() => renew("comments"), [renew]);
+  const comments = useLiveQuery(live.comments, {
+    refreshQuery: refreshComments,
+  });
+  const presenceUtils = presence.utils;
+  const commentUtils = comments.utils;
+  const pageUtils = page.utils;
+  const pagesUtils = pages.utils;
+  const elementUtils = elements.utils;
+
+  // Applied from the change listeners rather than after render, so the store
+  // already has a write's echo when awaitTxId resolves (no flicker)
+  useEffect(() => {
+    const apply = (rows: readonly LivePageRow[] | undefined) => {
+      const [row] = rows ?? [];
+      if (row) {
+        store.getState().applyLivePage(row);
+      }
+    };
+    apply(pageUtils.getSnapshot().data);
+    return pageUtils.onChange((snapshot) => apply(snapshot.data));
+  }, [pageUtils, store]);
+
+  useEffect(() => {
+    const apply = (rows: readonly LivePagesRow[] | undefined) => {
+      if (rows) {
+        store.getState().applyLivePages(rows);
+      }
+    };
+    apply(pagesUtils.getSnapshot().data);
+    return pagesUtils.onChange((snapshot) => apply(snapshot.data));
+  }, [pagesUtils, store]);
+
+  useEffect(() => {
+    const apply = (rows: readonly LiveElementRow[] | undefined) => {
+      if (rows) {
+        store.getState().applyLiveElements(rows);
+      }
+    };
+    apply(elementUtils.getSnapshot().data);
+    return elementUtils.onChange((snapshot) => apply(snapshot.data));
+  }, [elementUtils, store]);
+
+  useEffect(() => {
+    const apply = (rows: readonly LivePresenceRow[] | undefined) => {
+      if (rows) {
+        store.getState().applyPresence(rows);
+      }
+    };
+    apply(presenceUtils.getSnapshot().data);
+    return presenceUtils.onChange((snapshot) => apply(snapshot.data));
+  }, [presenceUtils, store]);
+
+  useEffect(() => {
+    const apply = (rows: readonly LiveCommentRow[] | undefined) => {
+      if (rows) {
+        store.getState().applyLiveComments(rows);
+      }
+    };
+    apply(commentUtils.getSnapshot().data);
+    return commentUtils.onChange((snapshot) => apply(snapshot.data));
+  }, [commentUtils, store]);
+
+  const status = combineStatus([
+    page.status,
+    pages.status,
+    elements.status,
+    presence.status,
+    comments.status,
+  ]);
+  useEffect(() => {
+    store.getState().setLiveStatus(status);
+  }, [status, store]);
+
+  // Only while streaming can the outbox wait for its writes to come back;
+  // otherwise it keeps them as the synced state itself
+  useEffect(() => {
+    if (status !== "live") {
+      setAwaitSync(null);
+      return;
+    }
+    setAwaitSync(async (txid, touched) => {
+      await Promise.all([
+        touched.elements
+          ? elementUtils.awaitTxId(txid, AWAIT_SYNC_TIMEOUT_MS)
+          : null,
+        touched.page ? pageUtils.awaitTxId(txid, AWAIT_SYNC_TIMEOUT_MS) : null,
+        touched.pages
+          ? pagesUtils.awaitTxId(txid, AWAIT_SYNC_TIMEOUT_MS)
+          : null,
+      ]);
+    });
+    return () => setAwaitSync(null);
+  }, [status, pageUtils, pagesUtils, elementUtils, setAwaitSync]);
+
+  return null;
+};
+
+// One Realtime client (one WebSocket) per session; a reconnect starts a new
+// session with fresh sealed queries
+const LiveSession = (props: LiveQueriesProps) => {
+  // Created once per session and never replaced
+  // oxlint-disable-next-line react/hook-use-state
+  const [client] = useState(() =>
+    // Connection problems show up as console warnings
+    createRealtimeClient({ logLevel: "warn", url: props.live.url })
+  );
+  return (
+    <RealtimeProvider client={client}>
+      <LiveQueries {...props} />
+    </RealtimeProvider>
+  );
+};
+
+// The live queries recover from most drops by themselves; when they give up
+// (error) or stay disconnected, start over with a fresh client and freshly
+// sealed queries, which always begins from a complete, current result
+const RECONNECT_DELAYS_MS = [1000, 3000, 10_000, 30_000];
+const STUCK_AFTER_MS = 30_000;
+
+export const LiveSync = ({ live, setAwaitSync }: LiveQueriesProps) => {
+  const store = useEditorStoreApi();
+  const designId = useEditor((state) => state.designId);
+  const status = useEditor((state) => state.liveStatus);
+  const [session, setSession] = useState({ attempt: 0, live });
+  const failuresRef = useRef(0);
+
+  const reconnect = useCallback(() => {
+    const renew = async () => {
+      try {
+        const sealed = await fetchSealed(designId, LIVE_QUERY_NAMES);
+        setSession((current) => ({
+          attempt: current.attempt + 1,
+          live: { ...current.live, ...sealed },
+        }));
+      } catch (error) {
+        if (isAccessLost(error)) {
+          store.getState().loseAccess();
+          return;
+        }
+        store.getState().setLiveStatus("error");
+      }
+    };
+    failuresRef.current += 1;
+    store.getState().setLiveStatus("connecting");
+    renew().catch(() => null);
+  }, [designId, store]);
+
+  useEffect(() => {
+    store.getState().setReconnectLive(reconnect);
+    return () => {
+      store.getState().setReconnectLive(null);
+      store.getState().setLiveStatus("off");
+    };
+  }, [reconnect, store]);
+
+  // Watchdog: restart when the session errors out or never gets live
+  useEffect(() => {
+    if (status === "live") {
+      failuresRef.current = 0;
+      return;
+    }
+    if (status === "off") {
+      return;
+    }
+    const backoff =
+      RECONNECT_DELAYS_MS[
+        Math.min(failuresRef.current, RECONNECT_DELAYS_MS.length - 1)
+      ];
+    const timer = setTimeout(
+      reconnect,
+      status === "error" ? backoff : STUCK_AFTER_MS
+    );
+    return () => clearTimeout(timer);
+  }, [reconnect, status]);
+
+  return (
+    <LiveSession
+      key={session.attempt}
+      live={session.live}
+      setAwaitSync={setAwaitSync}
+    />
+  );
+};

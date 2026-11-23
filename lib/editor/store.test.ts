@@ -1,0 +1,755 @@
+import { describe, expect, it } from "vitest";
+
+import type { DesignComment } from "@/lib/comments/schema";
+import {
+  createBoxElement,
+  createDocument,
+  createTextElement,
+} from "@/lib/document/factories";
+import { DOCUMENT_VERSION } from "@/lib/document/schema";
+import {
+  insertElement,
+  moveElementTo,
+  removeElements,
+  updateElement,
+} from "@/lib/editor/document-ops";
+import { resizeWithLayout } from "@/lib/editor/magic-resize";
+import { createEditorStore, selectDocument } from "@/lib/editor/store";
+import type { EditorInit } from "@/lib/editor/store";
+
+const PAGE = { height: 720, width: 1280 };
+
+const setup = () => {
+  const store = createEditorStore({
+    assets: [],
+    designId: "d",
+    document: createDocument(PAGE),
+    hasThumbnail: false,
+    libraryIds: [],
+    name: "Test",
+    role: "owner",
+    viewer: null,
+    visibility: "public",
+  });
+  const rect = createBoxElement("rect", PAGE);
+  store.getState().change((doc) => insertElement(doc, rect));
+  return { rect, store };
+};
+
+describe("editor store", () => {
+  it("revises the document without an undo step", () => {
+    const { rect, store } = setup();
+    const steps = store.getState().history.past.length;
+    store.getState().revise((doc) => updateElement(doc, rect.id, { x: 9 }));
+    expect(selectDocument(store.getState()).elements[0]?.x).toBe(9);
+    expect(store.getState().history.past).toHaveLength(steps);
+  });
+
+  it("makes a crop one undo step, or nothing when cancelled", () => {
+    const { rect, store } = setup();
+    const x = () => selectDocument(store.getState()).elements[0]?.x;
+
+    store.getState().startCrop(rect.id);
+    expect(store.getState().held.has(rect.id)).toBe(true);
+    store.getState().change((doc) => updateElement(doc, rect.id, { x: 5 }));
+    store.getState().change((doc) => updateElement(doc, rect.id, { x: 6 }));
+    store.getState().finishCrop(false);
+    expect(x()).toBe(rect.x);
+    expect(store.getState().cropTargetId).toBeNull();
+
+    store.getState().startCrop(rect.id);
+    store.getState().change((doc) => updateElement(doc, rect.id, { x: 7 }));
+    store.getState().finishCrop(true);
+    expect(x()).toBe(7);
+    expect(store.getState().held.has(rect.id)).toBe(false);
+    store.getState().undo();
+    expect(x()).toBe(rect.x);
+  });
+
+  it("opens the magic eraser on one image, with the document's undo waiting", () => {
+    const { rect, store } = setup();
+    const x = () => selectDocument(store.getState()).elements[0]?.x;
+    store.getState().startCrop(rect.id);
+    store.getState().change((doc) => updateElement(doc, rect.id, { x: 5 }));
+
+    store.getState().startErase(rect.id);
+    // The crop under way is kept
+    expect(store.getState().cropTargetId).toBeNull();
+    expect(x()).toBe(5);
+    expect(store.getState().eraseTargetId).toBe(rect.id);
+    expect(store.getState().selectedIds).toEqual([rect.id]);
+    expect(store.getState().held.has(rect.id)).toBe(true);
+
+    // ⌘Z belongs to the eraser's own strokes meanwhile
+    store.getState().undo();
+    expect(x()).toBe(5);
+
+    store.getState().finishErase();
+    expect(store.getState().eraseTargetId).toBeNull();
+    expect(store.getState().held.has(rect.id)).toBe(false);
+    store.getState().undo();
+    expect(x()).toBe(rect.x);
+  });
+
+  it("closes the magic eraser when a crop, comments or a version open", () => {
+    const { rect, store } = setup();
+    for (const open of [
+      () => store.getState().startCrop(rect.id),
+      () => store.getState().startPageCrop(),
+      () => store.getState().setCommentMode(true),
+      () => store.getState().previewVersion("v1"),
+    ]) {
+      store.getState().startErase(rect.id);
+      open();
+      expect(store.getState().eraseTargetId).toBeNull();
+      store.getState().finishCrop(false);
+      store.getState().finishPageCrop(false);
+      store.getState().setCommentMode(false);
+      store.getState().previewVersion(null);
+    }
+  });
+
+  it("tracks which AI tool is working on which image", () => {
+    const { rect, store } = setup();
+    const { history, seq } = store.getState();
+    const before = store.getState().imageJobs;
+    store.getState().setImageJob(rect.id, null);
+    expect(store.getState().imageJobs).toBe(before);
+
+    store.getState().setImageJob(rect.id, "upscale");
+    store.getState().setImageJob("other", "background");
+    expect(store.getState().imageJobs).toEqual({
+      other: "background",
+      [rect.id]: "upscale",
+    });
+    const running = store.getState().imageJobs;
+    store.getState().setImageJob(rect.id, "upscale");
+    expect(store.getState().imageJobs).toBe(running);
+
+    store.getState().setImageJob(rect.id, null);
+    expect(store.getState().imageJobs).toEqual({ other: "background" });
+    // Session state: nothing to undo or send
+    expect(store.getState().history).toBe(history);
+    expect(store.getState().seq).toBe(seq);
+  });
+
+  it("crops the page in one undo step, or not at all when cancelled", () => {
+    const { rect, store } = setup();
+    const page = () => selectDocument(store.getState());
+    store.getState().select([rect.id]);
+
+    store.getState().startPageCrop();
+    expect(store.getState().selectedIds).toEqual([]);
+    expect(store.getState().pageCrop).toEqual({ ...PAGE, x: 0, y: 0 });
+    store.getState().setPageCrop({ height: 300, width: 400, x: 10, y: 20 });
+    store.getState().finishPageCrop(false);
+    expect(store.getState().pageCrop).toBeNull();
+    expect(page().width).toBe(PAGE.width);
+
+    store.getState().startPageCrop();
+    store.getState().setPageCrop({ height: 300, width: 400, x: 10, y: 20 });
+    store.getState().finishPageCrop(true);
+    expect(page()).toMatchObject({ height: 300, width: 400 });
+    expect(page().elements[0]).toMatchObject({
+      x: rect.x - 10,
+      y: rect.y - 20,
+    });
+    store.getState().undo();
+    expect(page()).toMatchObject(PAGE);
+    expect(page().elements[0]).toMatchObject({ x: rect.x, y: rect.y });
+  });
+
+  it("refits the page crop's box to a picked shape", () => {
+    const { store } = setup();
+    store.getState().startPageCrop();
+    store.getState().setPageCropRatio("1:1");
+    expect(store.getState().pageCrop).toEqual({
+      height: 720,
+      width: 720,
+      x: 280,
+      y: 0,
+    });
+    store.getState().setPageCropRatio("free");
+    expect(store.getState().pageCrop?.width).toBe(720);
+    store.getState().finishPageCrop(false);
+    store.getState().startPageCrop();
+    expect(store.getState().pageCropRatio).toBe("free");
+  });
+
+  it("resizes the design in place as one undo step, which undo takes back whole", () => {
+    const { store } = setup();
+    const title = createTextElement("heading", PAGE);
+    store.getState().change((doc) => insertElement(doc, title));
+    const before = selectDocument(store.getState());
+    const steps = store.getState().history.past.length;
+    // Every character half the font size wide, lines 1.2 × the size tall
+    const measure = (text: typeof title) => ({
+      height: text.fontSize * 1.2,
+      width: text.width,
+    });
+
+    store
+      .getState()
+      .change((doc) =>
+        resizeWithLayout(doc, { height: 1920, width: 1080 }, "magic", measure)
+      );
+    const after = selectDocument(store.getState());
+    expect(after).toMatchObject({ height: 1920, width: 1080 });
+    expect(
+      after.elements.every(
+        (element, index) => element !== before.elements[index]
+      )
+    ).toBe(true);
+    expect(store.getState().history.past).toHaveLength(steps + 1);
+
+    store.getState().undo();
+    expect(selectDocument(store.getState())).toEqual(before);
+    store.getState().redo();
+    expect(selectDocument(store.getState())).toEqual(after);
+  });
+
+  it("makes a whole drag gesture a single undo step", () => {
+    const { rect, store } = setup();
+    const { begin, change, end, undo } = store.getState();
+
+    begin();
+    for (const x of [10, 20, 30]) {
+      change((doc) => updateElement(doc, rect.id, { x }));
+    }
+    end();
+
+    expect(selectDocument(store.getState()).elements[0]?.x).toBe(30);
+    undo();
+    expect(selectDocument(store.getState()).elements[0]?.x).toBe(rect.x);
+  });
+
+  it("drops selections of elements removed by undo or deletion", () => {
+    const { rect, store } = setup();
+    store.getState().select([rect.id]);
+
+    store.getState().undo();
+    expect(store.getState().selectedIds).toEqual([]);
+
+    store.getState().redo();
+    store.getState().select([rect.id]);
+    store.getState().change((doc) => removeElements(doc, [rect.id]));
+    expect(store.getState().selectedIds).toEqual([]);
+  });
+
+  it("restores a deleted element at its old place in the stack", () => {
+    const { rect, store } = setup();
+    const top = createBoxElement("ellipse", PAGE);
+    store.getState().change((doc) => insertElement(doc, top));
+    store.getState().change((doc) => removeElements(doc, [rect.id]));
+
+    store.getState().undo();
+    const ids = selectDocument(store.getState()).elements.map(
+      (element) => element.id
+    );
+    expect(ids).toEqual([rect.id, top.id]);
+  });
+
+  it("undoes a reorder", () => {
+    const { rect, store } = setup();
+    const top = createBoxElement("ellipse", PAGE);
+    store.getState().change((doc) => insertElement(doc, top));
+    store.getState().change((doc) => moveElementTo(doc, rect.id, 1));
+    const order = () =>
+      selectDocument(store.getState()).elements.map((element) => element.id);
+    expect(order()).toEqual([top.id, rect.id]);
+
+    store.getState().undo();
+    expect(order()).toEqual([rect.id, top.id]);
+    store.getState().redo();
+    expect(order()).toEqual([top.id, rect.id]);
+  });
+
+  it("starts connecting only when the server sent live queries", () => {
+    const base: EditorInit = {
+      assets: [],
+      designId: "d",
+      document: createDocument(PAGE),
+      hasThumbnail: false,
+      libraryIds: [],
+      name: "Test",
+      role: "owner",
+      viewer: null,
+      visibility: "public",
+    };
+    expect(createEditorStore(base).getState().liveStatus).toBe("off");
+    const sealed = { capability: "x", expiresAt: 0, queryFingerprint: "f" };
+    const live = {
+      comments: sealed,
+      elements: sealed,
+      page: sealed,
+      pages: sealed,
+      presence: sealed,
+      url: "wss://realtime.example",
+    };
+    expect(createEditorStore({ ...base, live }).getState().liveStatus).toBe(
+      "connecting"
+    );
+  });
+
+  it("lists live elements it can't read, until they're gone", () => {
+    const { rect, store } = setup();
+    const sticker = { ...rect, id: "g1", type: "hologram" };
+    store.getState().applyLiveElements([
+      { data: rect, id: rect.id, position: "a0" },
+      { data: sticker, id: "g1", position: "a1" },
+    ]);
+    expect(store.getState().skippedElementIds).toEqual(["g1"]);
+    expect(selectDocument(store.getState()).elements).toEqual([rect]);
+
+    store
+      .getState()
+      .applyLiveElements([{ data: rect, id: rect.id, position: "a0" }]);
+    expect(store.getState().skippedElementIds).toEqual([]);
+  });
+
+  it("stops writing once the design's version is newer than this tab's", () => {
+    const { rect, store } = setup();
+    const row = {
+      background: { color: "#ffffff", type: "solid" },
+      height: PAGE.height,
+      name: "Test",
+      visibility: "public",
+      width: PAGE.width,
+    };
+    store.getState().applyLivePage({ ...row, version: 1 });
+    store.getState().applyLivePage({ ...row, version: DOCUMENT_VERSION });
+    expect(store.getState().outdated).toBe(false);
+
+    store.getState().applyLivePage({ ...row, version: DOCUMENT_VERSION + 1 });
+    expect(store.getState().outdated).toBe(true);
+    const { doc, pending, seq } = store.getState();
+    store.getState().change((d) => updateElement(d, rect.id, { x: 5 }));
+    store.getState().undo();
+    store.getState().rename("Renamed");
+    expect(store.getState()).toMatchObject({ doc, pending, seq });
+
+    // It doesn't come back, even if a later row looks older
+    store.getState().applyLivePage({ ...row, version: 1 });
+    expect(store.getState().outdated).toBe(true);
+  });
+
+  it("stops writing when told a deploy outdated this tab", () => {
+    const { rect, store } = setup();
+    store.getState().markOutdated();
+    const { seq } = store.getState();
+    store.getState().change((d) => updateElement(d, rect.id, { x: 5 }));
+    store.getState().redo();
+    expect(store.getState().seq).toBe(seq);
+    expect(selectDocument(store.getState()).elements[0]?.x).toBe(rect.x);
+  });
+
+  it("clamps zoom and switches to manual mode", () => {
+    const { store } = setup();
+    store.getState().setZoom(100);
+    expect(store.getState()).toMatchObject({ zoom: 8, zoomMode: "manual" });
+    store.getState().zoomToFit();
+    expect(store.getState().zoomMode).toBe("fit");
+  });
+
+  it("stops an editor (but not the owner or a member) when the design goes private", () => {
+    const row = {
+      background: { color: "#ffffff", type: "solid" },
+      height: PAGE.height,
+      name: "Test",
+      version: 1,
+      width: PAGE.width,
+    };
+    const init: EditorInit = {
+      assets: [],
+      designId: "d",
+      document: createDocument(PAGE),
+      hasThumbnail: false,
+      libraryIds: [],
+      name: "Test",
+      role: "editor",
+      viewer: null,
+      visibility: "public",
+    };
+    const editor = createEditorStore(init);
+    editor.getState().applyLivePage({ ...row, visibility: "public" });
+    expect(editor.getState().accessLost).toBe(false);
+    editor.getState().applyLivePage({ ...row, visibility: "private" });
+    expect(editor.getState().accessLost).toBe(true);
+
+    const owner = createEditorStore({ ...init, role: "owner" });
+    owner.getState().applyLivePage({ ...row, visibility: "private" });
+    expect(owner.getState().accessLost).toBe(false);
+    expect(owner.getState().visibility).toBe("private");
+
+    // Shared with them: they stay
+    const member = createEditorStore({ ...init, role: "member" });
+    member.getState().applyLivePage({ ...row, visibility: "private" });
+    expect(member.getState().accessLost).toBe(false);
+  });
+
+  it("keeps the viewer's brand kit, and none for guests", () => {
+    const logo = {
+      height: 10,
+      id: "logo",
+      name: "logo.png",
+      sourceAssetId: null,
+      url: "/api/storage/assets/logo.png",
+      variant: null,
+      width: 10,
+    };
+    const init: EditorInit = {
+      assets: [],
+      brandKit: { colors: ["#ff0000"], fonts: [], logos: [] },
+      designId: "d",
+      document: createDocument(PAGE),
+      hasThumbnail: false,
+      libraryIds: [],
+      name: "Test",
+      role: "owner",
+      viewer: { id: "u", image: null, isAdmin: false, name: "Orc" },
+      visibility: "public",
+    };
+    const store = createEditorStore(init);
+    expect(store.getState().brandKit?.colors).toEqual(["#ff0000"]);
+
+    const kit = { colors: [], fonts: ["anton"], logos: [logo] };
+    store.getState().setBrandKit(kit);
+    expect(store.getState().brandKit).toBe(kit);
+    // A logo this tab hadn't seen becomes drawable
+    expect(store.getState().assets).toEqual([logo]);
+    // The same kit again changes nothing
+    const before = store.getState();
+    store.getState().setBrandKit({ ...kit });
+    expect(store.getState()).toBe(before);
+
+    // Guests have no kit, whatever they're handed
+    const guest = createEditorStore({ ...init, role: "editor", viewer: null });
+    expect(guest.getState().brandKit).toBeNull();
+    guest.getState().setBrandKit(kit);
+    expect(guest.getState().brandKit).toBeNull();
+    // Signed in but handed no kit: none either
+    const { brandKit: _none, ...withoutKit } = init;
+    expect(createEditorStore(withoutKit).getState().brandKit).toBeNull();
+  });
+  it("previews a version read-only: crops and typing end, undo waits", () => {
+    const { rect, store } = setup();
+    const x = () => selectDocument(store.getState()).elements[0]?.x;
+    store.getState().change((doc) => updateElement(doc, rect.id, { x: 5 }));
+    store.getState().setHistoryOpen(true);
+    store.getState().startCrop(rect.id);
+    store.getState().change((doc) => updateElement(doc, rect.id, { x: 9 }));
+
+    store.getState().previewVersion("v1");
+    // The crop was kept and closed, the sheet makes way for the preview
+    expect(store.getState().cropTargetId).toBeNull();
+    expect(store.getState().held.size).toBe(0);
+    expect(store.getState().historyOpen).toBe(false);
+    expect(store.getState().previewVersionId).toBe("v1");
+    expect(x()).toBe(9);
+
+    // Undo and redo wait while the workspace is hidden
+    store.getState().undo();
+    expect(x()).toBe(9);
+    store.getState().redo();
+    expect(x()).toBe(9);
+
+    store.getState().previewVersion(null);
+    expect(store.getState().previewVersionId).toBeNull();
+    store.getState().undo();
+    expect(x()).toBe(5);
+  });
+
+  it("ends typing and leaves a page crop as it was when a preview opens", () => {
+    const { rect, store } = setup();
+    store.getState().startPageCrop();
+    store.getState().setPageCrop({ height: 10, width: 10, x: 0, y: 0 });
+    store.getState().setEditingText(rect.id);
+
+    store.getState().previewVersion("v1");
+    expect(store.getState().editingTextId).toBeNull();
+    expect(store.getState().pageCrop).toBeNull();
+    expect(selectDocument(store.getState())).toMatchObject(PAGE);
+  });
+  it("clears undo history when a version is restored, but keeps pending writes", () => {
+    const { rect, store } = setup();
+    const row = {
+      background: { color: "#ffffff", type: "solid" },
+      height: PAGE.height,
+      name: "Test",
+      restore_seq: 0,
+      restored_by_name: null,
+      version: 1,
+      visibility: "public",
+      width: PAGE.width,
+    };
+    store.getState().applyLivePage(row);
+    store.getState().change((doc) => updateElement(doc, rect.id, { x: 5 }));
+    const { history, pending } = store.getState();
+    expect(history.past.length).toBeGreaterThan(0);
+    expect(pending.elements.has(rect.id)).toBe(true);
+
+    // The same restore count again changes nothing
+    store.getState().applyLivePage(row);
+    expect(store.getState().history).toBe(history);
+
+    store.getState().applyLivePage({
+      ...row,
+      restore_seq: 1,
+      restored_by_name: "Jay",
+    });
+    const state = store.getState();
+    expect(state.history.past).toEqual([]);
+    expect(state.history.future).toEqual([]);
+    expect(state.pending).toBe(pending);
+    expect(state.restoreSeq).toBe(1);
+    expect(state.lastRestore).toEqual({ byName: "Jay", own: false, seq: 1 });
+    // Undo has nothing left to take back
+    store.getState().undo();
+    expect(selectDocument(store.getState()).elements[0]?.x).toBe(5);
+
+    // A row lagging behind doesn't count as another restore
+    store.getState().applyLivePage({ ...row, restore_seq: 0 });
+    expect(store.getState().restoreSeq).toBe(1);
+  });
+
+  it("marks restores seen while restoring as this window's own", () => {
+    const store = createEditorStore({
+      assets: [],
+      designId: "d",
+      document: createDocument(PAGE),
+      hasThumbnail: false,
+      libraryIds: [],
+      name: "Test",
+      restoreSeq: 4,
+      role: "owner",
+      viewer: null,
+      visibility: "public",
+    });
+    const row = {
+      background: { color: "#ffffff", type: "solid" },
+      height: PAGE.height,
+      name: "Test",
+      version: 1,
+      visibility: "public",
+      width: PAGE.width,
+    };
+    // Rows from before version history say nothing about restores
+    store.getState().applyLivePage(row);
+    expect(store.getState().restoreSeq).toBe(4);
+
+    store.getState().beginRestore();
+    store.getState().applyLivePage({
+      ...row,
+      restore_seq: 5,
+      restored_by_name: "Me",
+    });
+    store.getState().endRestore();
+    expect(store.getState().lastRestore).toEqual({
+      byName: "Me",
+      own: true,
+      seq: 5,
+    });
+    expect(store.getState().restoring).toBe(false);
+  });
+});
+
+const comment = (
+  id: string,
+  patch: Partial<DesignComment> = {}
+): DesignComment => ({
+  anchorHeight: null,
+  anchorWidth: null,
+  anchorX: null,
+  anchorY: null,
+  authorId: "u",
+  authorImage: null,
+  authorName: "Jay",
+  body: "Hi",
+  createdAt: "2026-11-03T10:00:00.000Z",
+  editedAt: null,
+  elementId: null,
+  id,
+  mentions: {},
+  pageId: null,
+  resolvedAt: null,
+  threadId: null,
+  x: 1,
+  y: 2,
+  ...patch,
+});
+
+const PIN = { anchor: null, pageId: null, x: 10, y: 20 };
+
+// A comment's row as the live query delivers it
+const liveRow = (id: string, body = "Hi") => ({
+  anchor_height: null,
+  anchor_width: null,
+  anchor_x: null,
+  anchor_y: null,
+  author_id: "u",
+  author_image: null,
+  author_name: "Jay",
+  body,
+  created_at: new Date("2026-11-03T10:00:00.000Z"),
+  edited_at: null,
+  element_id: null,
+  id,
+  mentions: {},
+  page_id: null,
+  resolved_at: null,
+  thread_id: null,
+  x: 1,
+  y: 2,
+});
+
+describe("comments in the editor store", () => {
+  it("starts with the comments the page loaded", () => {
+    const store = createEditorStore({
+      assets: [],
+      comments: [comment("a")],
+      designId: "d",
+      document: createDocument(PAGE),
+      hasThumbnail: false,
+      libraryIds: [],
+      name: "Test",
+      role: "owner",
+      viewer: null,
+      visibility: "public",
+    });
+    expect(store.getState().comments.map((item) => item.id)).toEqual(["a"]);
+  });
+
+  it("clears the selection and ends crops and typing in comment mode", () => {
+    const { rect, store } = setup();
+    store.getState().select([rect.id]);
+    store.getState().setEditingText(rect.id);
+    store.getState().startCrop(rect.id);
+
+    store.getState().setCommentMode(true);
+    expect(store.getState()).toMatchObject({
+      commentMode: true,
+      cropTargetId: null,
+      editingTextId: null,
+      selectedIds: [],
+    });
+
+    store.getState().placeDraft(PIN);
+    store.getState().setCommentMode(false);
+    expect(store.getState().commentMode).toBe(false);
+    expect(store.getState().draftPin).toBeNull();
+  });
+
+  it("leaves a draft, then an open thread, then comment mode, then nothing", () => {
+    const { store } = setup();
+    store.getState().setCommentMode(true);
+    store.getState().openThread("a");
+    store.getState().placeDraft(PIN);
+    // Placing a draft closes the open thread
+    expect(store.getState().openThreadId).toBeNull();
+    store.getState().openThread("a");
+    store.getState().placeDraft(PIN);
+
+    expect(store.getState().leaveComments()).toBe(true);
+    expect(store.getState().draftPin).toBeNull();
+    expect(store.getState().commentMode).toBe(true);
+
+    store.getState().openThread("a");
+    expect(store.getState().leaveComments()).toBe(true);
+    expect(store.getState().openThreadId).toBeNull();
+    expect(store.getState().commentMode).toBe(true);
+
+    expect(store.getState().leaveComments()).toBe(true);
+    expect(store.getState().commentMode).toBe(false);
+
+    expect(store.getState().leaveComments()).toBe(false);
+  });
+
+  it("shows a posted comment at once, and replaces it when it changes", () => {
+    const { store } = setup();
+    const { history } = store.getState();
+    store.getState().upsertComment(comment("a"));
+    store.getState().upsertComment(comment("b", { threadId: "a" }));
+    const before = store.getState().comments;
+    store.getState().upsertComment(comment("a", { body: "Edited" }));
+    const after = store.getState().comments;
+    expect(after.map((item) => [item.id, item.body])).toEqual([
+      ["a", "Edited"],
+      ["b", "Hi"],
+    ]);
+    // Untouched comments keep their identity
+    expect(after[1]).toBe(before[1]);
+    // Nothing about comments is undoable
+    expect(store.getState().history).toBe(history);
+  });
+
+  it("takes comments from the live query, keeping its own until they show", () => {
+    const { store } = setup();
+    store.getState().applyLiveComments([liveRow("a")]);
+    expect(store.getState().comments).toEqual([comment("a")]);
+
+    // Posted here, then a result from before the post arrives
+    store.getState().upsertComment(comment("mine"));
+    store.getState().openThread("mine");
+    store.getState().applyLiveComments([liveRow("a")]);
+    expect(store.getState().comments.map((item) => item.id)).toEqual([
+      "a",
+      "mine",
+    ]);
+    expect(store.getState().openThreadId).toBe("mine");
+
+    // The live query shows it: nothing left to wait for
+    store.getState().applyLiveComments([liveRow("a"), liveRow("mine")]);
+    expect(store.getState().commentEchoes.size).toBe(0);
+
+    // Someone deleted the open thread
+    store.getState().applyLiveComments([liveRow("a")]);
+    expect(store.getState().openThreadId).toBeNull();
+  });
+
+  it("removes a deleted thread with its replies, and keeps it gone", () => {
+    const { store } = setup();
+    store.getState().upsertComment(comment("a"));
+    store.getState().upsertComment(comment("r", { threadId: "a" }));
+    store.getState().upsertComment(comment("b"));
+    store.getState().openThread("a");
+    store.getState().removeComment("a");
+    expect(store.getState().comments.map((item) => item.id)).toEqual(["b"]);
+    expect(store.getState().openThreadId).toBeNull();
+    // A live result from before the delete doesn't bring it back
+    store.getState().applyLiveComments([liveRow("a"), liveRow("b")]);
+    expect(store.getState().comments.map((item) => item.id)).toEqual(["b"]);
+  });
+
+  it("opens a thread and asks to bring it into view, every time", () => {
+    const { store } = setup();
+    store.getState().placeDraft(PIN);
+    store.getState().focusThread("a");
+    expect(store.getState()).toMatchObject({
+      draftPin: null,
+      focusRequest: { seq: 1, threadId: "a" },
+      openThreadId: "a",
+    });
+    store.getState().focusThread("a");
+    expect(store.getState().focusRequest).toEqual({ seq: 2, threadId: "a" });
+  });
+
+  it("opens the thread a link asked for", () => {
+    const store = createEditorStore({
+      assets: [],
+      comments: [comment("a")],
+      designId: "d",
+      document: createDocument(PAGE),
+      hasThumbnail: false,
+      libraryIds: [],
+      name: "Test",
+      openThreadId: "a",
+      role: "owner",
+      viewer: null,
+      visibility: "public",
+    });
+    expect(store.getState()).toMatchObject({
+      focusRequest: { seq: 1, threadId: "a" },
+      openThreadId: "a",
+    });
+  });
+});
